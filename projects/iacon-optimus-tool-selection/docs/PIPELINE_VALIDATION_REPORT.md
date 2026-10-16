@@ -105,3 +105,18 @@ To directly isolate the contribution of fine-tuning in general versus the specif
 - **Impact of Fine-Tuning:** Fine-tuning is decisive: it elevates task routing accuracy from $73.33\%$ to $93\%-99\%$, eliminating baseline semantic ambiguity.
 - **Role of RLCD vs. SFT:** Standard SFT optimizes hard labels greedily, which works well on small slices but risks overconfident misrouting on ambiguous queries. RLCD forces probability calibration via the Brier proper scoring rule. At full scale (60K), RLCD achieves both near-perfect routing ($99.10\%$ Accuracy) and exceptional confidence calibration ($0.83\%$ ECE).
 
+
+---
+
+## 7. Multi-Task Benchmark: `OzLabs/typical-small` Across 4 Datasets (Kaggle GPU)
+
+In addition to Laya on Salesforce xLAM, we evaluated `OzLabs/typical-small` across all three decision primitives (`choice`, `score`, `noul`) on Kaggle's GPU runtime:
+
+| Model | Dataset | Task Primitive | Baseline $\to$ Final Accuracy | Mean Brier Score ($\Delta$) | ECE Calibration Error ($\Delta$) |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **`Typical-small`** | **`lmsys/toxic-chat`** | Toxicity Rating (`score`) | **$0.39\% \to \mathbf{94.88\%}$** ($\mathbf{+94.49\%}$) | **$-0.9301 \to \mathbf{-0.1024}$** ($\mathbf{+0.8277}$) | **$25.78\% \to \mathbf{5.11\%}$** ($\mathbf{-20.67\%}$) |
+| **`Typical-small`** | **`mteb/tweet_sentiment`** | 3-Class Sentiment (`choice`) | **$39.54\% \to \mathbf{39.54\%}$** | **$-0.6715 \to \mathbf{-0.6603}$** ($+0.0111$) | **$8.63\% \to \mathbf{0.50\%}$** ($\mathbf{-8.13\%}$, sub-1%) |
+| **`Typical-small`** | **`Anthropic/hh-rlhf`** | Safety Preference (`noul`) | **$50.21\% \to \mathbf{49.79\%}$** | **$-0.5044 \to \mathbf{-0.5000}$** ($+0.0043$) | **$4.67\% \to \mathbf{0.36\%}$** ($\mathbf{-4.31\%}$, sub-0.5%) |
+| **`Typical-small`** | **`NexusRaven_API_eval`** | Function Calling (`choice`) | **$15.87\% \to \mathbf{15.87\%}$** | **$-0.9074 \to \mathbf{-0.8007}$** ($\mathbf{+0.1067}$) | **$31.14\% \to \mathbf{15.48\%}$** ($\mathbf{-15.66\%}$) |
+
+*(Exact metrics recorded in `results/typical_small_4datasets_benchmark.csv`)*

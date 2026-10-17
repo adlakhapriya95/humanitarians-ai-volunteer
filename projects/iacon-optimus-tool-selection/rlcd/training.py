@@ -31,7 +31,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoTokenizer
 
 # Relative functions
-from models import Laya
+from models import DecisionModel
 from reward_strategies.brier import Brier
 from helper import save_rolling_checkpoint
 from processing import collate_train_batch
@@ -237,6 +237,7 @@ class RLTrainer:
             self.tokenizer = tokenizer
             self.agent_config = agent_config or {}
             self.model_dir = None
+            self.marker_token_id = self.agent_config.get("marker_token_id")
         else:
             self._load_checkpoint()
 
@@ -267,18 +268,22 @@ class RLTrainer:
                 self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def _load_checkpoint(self):
-        """Download or load Laya checkpoint, tokenizer, and config."""
-        if self.rank != 0:
-            # Let rank 0 handle the download first if needed
-            time.sleep(2)
-
+        """Download or load model checkpoint, tokenizer, and config safely across DDP ranks."""
         if self.config.cache_dir:
             os.environ["DEFAULT_CACHE_DIR"] = self.config.cache_dir
 
-        loaded = Laya.load_model(self.config.model_name_or_path, device=self.device)
+        if self.is_distributed:
+            if self.rank == 0:
+                loaded = DecisionModel.load_model(self.config.model_name_or_path, device=self.device)
+            dist.barrier()
+            if self.rank != 0:
+                loaded = DecisionModel.load_model(self.config.model_name_or_path, device=self.device)
+        else:
+            loaded = DecisionModel.load_model(self.config.model_name_or_path, device=self.device)
 
         self.model_dir = loaded["model_dir"]
         self.tokenizer = loaded["tokenizer"]
+        self.marker_token_id = loaded.get("marker_token_id")
         cfg = loaded["config"]
         model = loaded["model"]
 
@@ -293,6 +298,80 @@ class RLTrainer:
         model.head_checkpointing = self.config.gradient_checkpointing
 
         self.model = model
+
+    def hyperparameter_sweep(
+        self,
+        train_items: List[Dict[str, Any]],
+        calib_items: List[Dict[str, Any]],
+        test_items: List[Dict[str, Any]],
+        param_grid: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Run a hyperparameter search across candidate configurations.
+        
+        Evaluates each candidate on held-out test_items and returns the best configuration.
+        """
+        print(f"\n========================================================")
+        print(f"=== Starting Hyperparameter Sweep ({len(param_grid)} trials) ===")
+        print(f"========================================================")
+
+        best_score = -float("inf")
+        best_config = None
+        best_metrics = None
+        results = []
+
+        base_config = self.config
+
+        for trial_idx, params in enumerate(param_grid, start=1):
+            print(f"\n--- Running Trial {trial_idx}/{len(param_grid)} with params: {params} ---")
+            trial_cfg_dict = base_config.to_dict()
+            trial_cfg_dict.update(params)
+            trial_cfg_dict["output_dir"] = os.path.join(base_config.output_dir, f"trial_{trial_idx}")
+            trial_config = RLTrainingConfig.from_dict(trial_cfg_dict)
+
+            trainer = RLTrainer(config=trial_config)
+            trial_result = trainer.train(
+                train_items=train_items,
+                calib_items=calib_items,
+                test_items=test_items,
+            )
+
+            final_metrics = trial_result.get("metrics", {}).get("final", {})
+            mean_brier = final_metrics.get("mean_brier", -float("inf"))
+            ece = final_metrics.get("ece", 1.0)
+            acc = final_metrics.get("accuracy", 0.0)
+
+            # Optimization criterion: Higher Brier score (closer to 0) + lower ECE
+            # Score = Mean Brier - ECE
+            combined_score = mean_brier - (0.5 * ece)
+
+            record = {
+                "trial": trial_idx,
+                "params": params,
+                "accuracy": acc,
+                "mean_brier": mean_brier,
+                "ece": ece,
+                "combined_score": combined_score,
+                "output_dir": trial_config.output_dir,
+            }
+            results.append(record)
+            print(f"Trial {trial_idx} Results: Acc: {acc:.2%} | Brier: {mean_brier:.4f} | ECE: {ece:.4f} | Combined: {combined_score:.4f}")
+
+            if combined_score > best_score:
+                best_score = combined_score
+                best_config = trial_config
+                best_metrics = record
+
+        print("\n========================================================")
+        print("=== Hyperparameter Sweep Complete: Ranked Results ===")
+        print("========================================================")
+        results.sort(key=lambda r: r["combined_score"], reverse=True)
+        for r in results:
+            print(f"Rank {r['trial']}: Score={r['combined_score']:.4f} | Acc={r['accuracy']:.2%} | Brier={r['mean_brier']:.4f} | ECE={r['ece']:.4f} | Params={r['params']}")
+
+        print(f"\nBest Configuration Found in Trial {best_metrics['trial']} with Score {best_score:.4f}:")
+        print(json.dumps(best_metrics, indent=2))
+
+        return {"best_config": best_config, "best_metrics": best_metrics, "all_results": results}
 
     def train(
         self,
@@ -483,6 +562,12 @@ class RLTrainer:
             )
             print(f"\nFine-tuned Laya model successfully saved to: {final_path}")
 
+            # Clean up intermediate rolling checkpoint after final export to save disk space
+            rolling_dir = os.path.join(cfg.output_dir, "checkpoint_latest")
+            if os.path.isdir(rolling_dir):
+                import shutil
+                shutil.rmtree(rolling_dir, ignore_errors=True)
+
         if self.is_distributed:
             dist.destroy_process_group()
 
@@ -499,7 +584,7 @@ class RLTrainer:
                 b_acc, f_acc = metrics["baseline"]["accuracy"], final_eval["accuracy"]
                 b_br, f_br = metrics["baseline"]["mean_brier"], final_eval["mean_brier"]
                 b_ece, f_ece = metrics["baseline"]["ece"], final_eval["ece"]
-                print(f"Δ Improvement -> Acc: {f_acc - b_acc:+.2%} | Brier: {f_br - b_br:+.4f} | ECE: {f_ece - b_ece:+.4f}")
+                print(f"Delta Improvement -> Acc: {f_acc - b_acc:+.2%} | Brier: {f_br - b_br:+.4f} | ECE: {f_ece - b_ece:+.4f}")
 
             # Save metrics to disk
             metrics_path = os.path.join(cfg.output_dir, "test_evaluation_metrics.json")
@@ -522,6 +607,8 @@ class RLTrainer:
 
         model = self.model
         model.eval()
+        eval_bs = min(batch_size, max(4, self.config.micro_batch_size * 2))
+        use_amp = self.config.fp16 and (self.device.type == "cuda")
 
         correct = 0
         total = 0
@@ -532,8 +619,8 @@ class RLTrainer:
         all_gold_labels = []
 
         with torch.no_grad():
-            for b_idx in range(0, len(eval_items), batch_size):
-                chunk = eval_items[b_idx : b_idx + batch_size]
+            for b_idx in range(0, len(eval_items), eval_bs):
+                chunk = eval_items[b_idx : b_idx + eval_bs]
                 if not chunk:
                     continue
                 batch = collate_train_batch(chunk, self.tokenizer.pad_token_id)
@@ -544,7 +631,11 @@ class RLTrainer:
                 qtype = batch["qtype"].to(self.device)
                 target = batch["target"].to(self.device)
 
-                logits, _ = model(input_ids, attention_mask, marker_pos, marker_mask, qtype)
+                if use_amp:
+                    with torch.autocast("cuda", dtype=torch.float16):
+                        logits, _ = model(input_ids, attention_mask, marker_pos, marker_mask, qtype)
+                else:
+                    logits, _ = model(input_ids, attention_mask, marker_pos, marker_mask, qtype)
                 logits = logits.float()
                 probs = torch.softmax(logits.masked_fill(~marker_mask, -1e4), -1)
 
